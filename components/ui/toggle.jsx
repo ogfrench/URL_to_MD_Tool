@@ -7,13 +7,13 @@ import { Toggle as TogglePrimitive } from "radix-ui"
 import { cn } from "@/lib/utils"
 
 const toggleVariants = cva(
-  "inline-flex items-center justify-center gap-2 rounded-md text-sm font-medium whitespace-nowrap transition-colors outline-none focus-visible:ring-2 focus-visible:ring-[var(--green)]/40 disabled:pointer-events-none disabled:opacity-60 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+  "inline-flex cursor-pointer items-center justify-center gap-2 rounded-md text-sm font-medium whitespace-nowrap transition-colors outline-none focus-visible:ring-2 focus-visible:ring-[var(--green)]/40 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-60 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
   {
     variants: {
       variant: {
-        default: "!bg-[var(--secondary)] !text-[var(--ink-2)] hover:!bg-[var(--secondary-hover)] data-[state=on]:!bg-[var(--green-soft)] data-[state=on]:!text-[var(--green-2)] data-[state=on]:!font-semibold",
+        default: "!bg-[var(--secondary)] !text-[var(--ink-2)] hover:!bg-[var(--secondary-hover)] data-[state=on]:!bg-[var(--green-soft)] data-[state=on]:!text-[var(--green-2)] data-[state=on]:!font-medium",
         outline:
-          "!bg-[var(--secondary)] !text-[var(--ink-2)] hover:!bg-[var(--secondary-hover)] hover:!text-[var(--navy)] data-[state=on]:!bg-[var(--green-soft)] data-[state=on]:!text-[var(--green-2)] data-[state=on]:!font-semibold data-[state=on]:!ring-1 data-[state=on]:!ring-[var(--green)]/40 data-[state=on]:!ring-inset",
+          "!bg-[var(--secondary)] !text-[var(--ink-2)] hover:!bg-[var(--secondary-hover)] hover:!text-[var(--navy)] data-[state=on]:!bg-[var(--green-soft)] data-[state=on]:!text-[var(--green-2)] data-[state=on]:!font-medium data-[state=on]:!ring-1 data-[state=on]:!ring-[var(--green)]/40 data-[state=on]:!ring-inset",
       },
       size: {
         default: "h-9 min-w-9 px-2",

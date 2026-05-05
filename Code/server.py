@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from converter import LoadOptions, open_page, sanitize_filename, _extract_links
@@ -24,9 +24,27 @@ from output import save_pdf, save_markdown, merge_pdfs, concat_markdown
 from jobs import store
 
 OUTPUT_ROOT = Path(__file__).parent.parent / "output"
+MERGED_DIR = OUTPUT_ROOT / "_merged"
 LOG_DIR = Path(__file__).parent.parent / "logs"
 CONCURRENCY = 3
 ITEM_TIMEOUT = 120  # seconds — hard ceiling per URL so a wedged worker can't hang the job
+
+FORMATS = {
+    "pdf": {
+        "ext": "pdf",
+        "media_type": "application/pdf",
+        "merge": lambda done_items, out: merge_pdfs([Path(i["file"]) for i in done_items], out),
+    },
+    "md": {
+        "ext": "md",
+        "media_type": "text/markdown",
+        "merge": concat_markdown,
+    },
+}
+
+
+def _format_spec(fmt: str) -> dict:
+    return FORMATS.get(fmt) or FORMATS["pdf"]
 
 LOG_DIR.mkdir(exist_ok=True)
 
@@ -97,9 +115,8 @@ if not jobs_logger.handlers:
     jobs_logger.addHandler(_jobs_file_handler)
 
 app = FastAPI()
-_executor = ThreadPoolExecutor(max_workers=CONCURRENCY)
+_executor = ThreadPoolExecutor(max_workers=CONCURRENCY + 2)
 _semaphore = asyncio.Semaphore(CONCURRENCY)
-# Separate executor for merge work so a long merge doesn't block the conversion pool.
 _merge_executor = ThreadPoolExecutor(max_workers=1)
 
 
@@ -108,6 +125,13 @@ class ConvertRequest(BaseModel):
     format: str = "pdf"
     collection: str = ""
     options: dict = {}
+
+
+def _mark_merge_dirty(job: dict) -> None:
+    """Invalidate the merged-cache flag and reset the skipped count so the
+    X-Merged-Skipped header can't reflect a previous rebuild."""
+    job["merged_dirty"] = True
+    job["merged_skipped"] = 0
 
 
 def _log_job_start(job: dict) -> None:
@@ -138,16 +162,22 @@ def _log_job_finish(job: dict) -> None:
 
 @app.post("/api/convert")
 async def post_convert(body: ConvertRequest):
+    if not body.urls:
+        raise HTTPException(status_code=400, detail="At least one URL is required.")
     recursive = bool(body.options.get("recursive", False))
     max_pages = int(body.options.get("maxPages", 100))
-    job = store.create(
-        urls=body.urls,
-        fmt=body.format,
-        name=body.collection,
-        options=body.options,
-        recursive=recursive,
-        max_pages=max_pages,
-    )
+    try:
+        job = store.create(
+            urls=body.urls,
+            fmt=body.format,
+            name=body.collection,
+            options=body.options,
+            recursive=recursive,
+            max_pages=max_pages,
+        )
+    except ValueError as e:
+        # e.g. recursive seeds spanning multiple hostnames.
+        raise HTTPException(status_code=400, detail=str(e))
     logger.info(
         "Job %s started — %d URL(s), format=%s, collection=%r, recursive=%s",
         job["id"], len(body.urls), body.format, body.collection or "(none)", recursive,
@@ -170,9 +200,6 @@ async def post_convert(body: ConvertRequest):
 
 
 async def _run_with_timeout(loop, job: dict, item: dict) -> list[str]:
-    """Run _convert_one_sync with a hard wall-clock timeout. On timeout the worker
-    thread leaks (Python can't kill threads); the executor slot stays held until
-    Playwright eventually unwinds. Item still flips to error so the UI moves on."""
     try:
         return await asyncio.wait_for(
             loop.run_in_executor(_executor, _convert_one_sync, job, item),
@@ -315,7 +342,7 @@ def _convert_one_sync(job: dict, item: dict) -> list[str]:
     out_dir = OUTPUT_ROOT / coll if coll else OUTPUT_ROOT
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = sanitize_filename(url)
-    suffix = ".pdf" if fmt == "pdf" else ".md"
+    suffix = "." + _format_spec(fmt)["ext"]
     out_path = out_dir / (stem + suffix)
 
     try:
@@ -335,7 +362,8 @@ def _convert_one_sync(job: dict, item: dict) -> list[str]:
         item["file"] = str(out_path)
         item["size"] = out_path.stat().st_size
         item["filename"] = stem + suffix
-        job["merged_dirty"] = True
+        _mark_merge_dirty(job)
+        store.persist(job["id"])
         logger.info("[%s] Done: %s → %s (%.1f KB)",
                     job["id"], url, item["filename"], item["size"] / 1024)
         store.push_event(job["id"], {
@@ -380,7 +408,38 @@ async def delete_collection(job_id: str):
             p = Path(item["file"]).resolve()
             if p.is_relative_to(OUTPUT_ROOT.resolve()):
                 p.unlink(missing_ok=True)
+    # Evict the cached merged blob — orphaned files would otherwise live
+    # forever under output/_merged/.
+    (MERGED_DIR / f"{job_id}.{_format_spec(job['format'])['ext']}").unlink(missing_ok=True)
     return {"ok": True}
+
+
+@app.get("/api/jobs/{job_id}")
+async def get_job(job_id: str):
+    job = store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {
+        "job_id": job["id"],
+        "name": job["name"],
+        "format": job["format"],
+        "createdAt": job["created_at"],
+        "isRunning": any(i["status"] in ("queued", "working") for i in job["items"]),
+        "items": [
+            {
+                "id": i["id"],
+                "url": i["url"],
+                "domain": i["domain"],
+                "favicon": i["favicon"],
+                "status": i["status"],
+                "title": i["title"],
+                "size": i["size"],
+                "filename": i["filename"],
+                "error": i["error"],
+            }
+            for i in job["items"]
+        ],
+    }
 
 
 @app.get("/api/jobs/{job_id}/stream")
@@ -462,6 +521,7 @@ async def retry_item(job_id: str, url_id: str):
         job["cancelled"] = False
         async with sem:
             await loop.run_in_executor(_executor, _convert_one_sync, job, item)
+        _mark_merge_dirty(job)
         if not any(i["status"] in ("queued", "working") for i in job["items"]):
             store.push_event(job_id, {"type": "done"})
 
@@ -494,15 +554,6 @@ def _download_filename(job: dict, ext: str) -> str:
     return f"{sanitize_filename(stem)}.{ext}"
 
 
-def _do_merge(fmt: str, done_items: list[dict], out_path: Path) -> None:
-    """Sync work — runs in _merge_executor so it doesn't block the event loop or
-    starve the conversion pool."""
-    if fmt == "pdf":
-        merge_pdfs([Path(i["file"]) for i in done_items], out_path)
-    else:
-        concat_markdown(done_items, out_path)
-
-
 @app.get("/api/jobs/{job_id}/merged")
 async def download_merged(job_id: str):
     job = store.get(job_id)
@@ -511,22 +562,25 @@ async def download_merged(job_id: str):
     done = [i for i in job["items"] if i["status"] == "done" and i["file"]]
     if not done:
         raise HTTPException(status_code=404, detail="No completed files")
-    fmt = job["format"]
-    ext = "pdf" if fmt == "pdf" else "md"
-    out_path = OUTPUT_ROOT / "_merged" / f"{job_id}.{ext}"
+    spec = _format_spec(job["format"])
+    out_path = MERGED_DIR / f"{job_id}.{spec['ext']}"
     if job.get("merged_dirty", True) or not out_path.exists():
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(_merge_executor, _do_merge, fmt, done, out_path)
+        skipped = await loop.run_in_executor(_merge_executor, spec["merge"], done, out_path)
         job["merged_dirty"] = False
+        job["merged_skipped"] = skipped
+    skipped = job.get("merged_skipped", 0)
+    headers = {"X-Merged-Skipped": str(skipped)} if skipped else {}
     return FileResponse(
         path=str(out_path),
-        filename=_download_filename(job, ext),
-        media_type="application/pdf" if fmt == "pdf" else "text/markdown",
+        filename=_download_filename(job, spec["ext"]),
+        media_type=spec["media_type"],
+        headers=headers,
     )
 
 
 class RenameRequest(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=200)
 
 
 @app.patch("/api/collections/{job_id}")
@@ -534,8 +588,11 @@ async def rename_collection(job_id: str, body: RenameRequest):
     job = store.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    new_name = (body.name or "").strip()
+    new_name = body.name.strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="Name cannot be empty")
     job["name"] = new_name
+    store.persist(job_id)
     return {"ok": True, "name": new_name}
 
 
@@ -558,6 +615,16 @@ async def download_zip(job_id: str):
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
     )
+
+
+@app.on_event("startup")
+def _hydrate_and_sweep() -> None:
+    store.hydrate()
+    MERGED_DIR.mkdir(parents=True, exist_ok=True)
+    valid_ids = {j["id"] for j in store.list_all()}
+    for f in MERGED_DIR.iterdir():
+        if f.is_file() and f.stem not in valid_ids:
+            f.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

@@ -6,11 +6,16 @@ from fastapi.testclient import TestClient
 from unittest.mock import MagicMock, patch
 import server
 from server import app, _convert_one_sync
+import jobs as jobs_module
 from jobs import JobStore
 
 
 @pytest.fixture(autouse=True)
-def fresh_store(monkeypatch):
+def fresh_store(monkeypatch, tmp_path):
+    # Isolate from real ./output: the FastAPI startup hook hydrates from META_DIR
+    # and sweeps MERGED_DIR; without these patches tests would mutate real data.
+    monkeypatch.setattr(jobs_module, "META_DIR", tmp_path / "_meta")
+    monkeypatch.setattr(server, "MERGED_DIR", tmp_path / "_merged")
     s = JobStore()
     monkeypatch.setattr(server, "store", s)
     return s
