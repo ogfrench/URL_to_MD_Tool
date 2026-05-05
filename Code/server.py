@@ -208,6 +208,7 @@ async def _run_with_timeout(loop, job: dict, item: dict) -> list[str]:
     except asyncio.TimeoutError:
         item["status"] = "error"
         item["error"] = f"Took longer than {ITEM_TIMEOUT}s"
+        store.persist(job["id"])
         logger.error("[%s] Timed out: %s", job["id"], item["url"])
         store.push_event(job["id"], {
             "type": "status", "url_id": item["id"],
@@ -227,6 +228,7 @@ async def _run_job(job: dict) -> None:
                 if job["cancelled"]:
                     item["status"] = "error"
                     item["error"] = "Cancelled"
+                    store.persist(job["id"])
                     store.push_event(job["id"], {
                         "type": "status", "url_id": item["id"],
                         "status": "error", "error": "Cancelled",
@@ -305,6 +307,7 @@ def _convert_one_sync(job: dict, item: dict) -> list[str]:
     if job["cancelled"]:
         item["status"] = "error"
         item["error"] = "Cancelled"
+        store.persist(job["id"])
         store.push_event(job["id"], {
             "type": "status", "url_id": item["id"],
             "status": "error", "error": "Cancelled",
@@ -316,6 +319,7 @@ def _convert_one_sync(job: dict, item: dict) -> list[str]:
     except ValueError as e:
         item["status"] = "error"
         item["error"] = str(e)
+        store.persist(job["id"])
         logger.error("[%s] Invalid URL: %s — %s", job["id"], item["url"], e)
         store.push_event(job["id"], {
             "type": "status", "url_id": item["id"],
@@ -374,6 +378,7 @@ def _convert_one_sync(job: dict, item: dict) -> list[str]:
     except Exception as e:
         item["status"] = "error"
         item["error"] = str(e)
+        store.persist(job["id"])
         logger.error("[%s] Failed: %s — %s", job["id"], url, e, exc_info=True)
         store.push_event(job["id"], {
             "type": "status", "url_id": item["id"],
@@ -500,6 +505,7 @@ async def cancel_job(job_id: str):
                 "type": "status", "url_id": item["id"],
                 "status": "error", "error": "Cancelled",
             })
+    store.persist(job_id)
     store.push_event(job_id, {"type": "done"})
     return {"ok": True}
 
@@ -514,14 +520,16 @@ async def retry_item(job_id: str, url_id: str):
         raise HTTPException(status_code=404, detail="Item not found")
     item["status"] = "queued"
     item["error"] = None
+    store.persist(job_id)
     loop = asyncio.get_running_loop()
     sem = _semaphore
 
     async def _do_retry():
         job["cancelled"] = False
         async with sem:
-            await loop.run_in_executor(_executor, _convert_one_sync, job, item)
+            await _run_with_timeout(loop, job, item)
         _mark_merge_dirty(job)
+        store.persist(job_id)
         if not any(i["status"] in ("queued", "working") for i in job["items"]):
             store.push_event(job_id, {"type": "done"})
 

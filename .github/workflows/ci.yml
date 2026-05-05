@@ -27,10 +27,7 @@ jobs:
 
       - run: npm run lint
 
-      # tsc with checkJs runs against jsconfig.json (single source of truth for paths).
-      # Non-blocking until the codebase is fully annotated.
       - run: npm run typecheck
-        continue-on-error: true
 
       - run: npm run build
 

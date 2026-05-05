@@ -1,8 +1,10 @@
 import asyncio
+import json
 import time
 
 import pytest
 
+import jobs as jobs_module
 import server
 from jobs import JobStore
 
@@ -53,6 +55,9 @@ async def test_run_with_timeout_marks_error_on_timeout(fresh_store, monkeypatch)
     assert result == []
     assert item["status"] == "error"
     assert "longer than" in item["error"].lower()
+    persisted = json.loads((jobs_module.META_DIR / f"{job['id']}.json").read_text(encoding="utf-8"))
+    assert persisted["items"][0]["status"] == "error"
+    assert "longer than" in persisted["items"][0]["error"].lower()
 
 
 @pytest.mark.asyncio

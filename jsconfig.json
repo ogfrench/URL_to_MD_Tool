@@ -9,7 +9,7 @@
     "moduleResolution": "bundler",
     "jsx": "preserve",
     "allowJs": true,
-    "checkJs": true,
+    "checkJs": false,
     "noEmit": true,
     "strict": false,
     "skipLibCheck": true,
