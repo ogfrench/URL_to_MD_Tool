@@ -8,7 +8,6 @@ import io
 import json
 import logging
 import shutil
-import webbrowser
 import zipfile
 from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor
@@ -16,19 +15,18 @@ from concurrent.futures import ThreadPoolExecutor
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from converter import LoadOptions, open_page, sanitize_filename, _extract_links
 from helpers import normalize_url
-from output import save_pdf, save_markdown
+from output import save_pdf, save_markdown, merge_pdfs, concat_markdown
 from jobs import store
 
-WEB_DIR = Path(__file__).parent.parent / "web"
 OUTPUT_ROOT = Path(__file__).parent.parent / "output"
 LOG_DIR = Path(__file__).parent.parent / "logs"
 CONCURRENCY = 3
+ITEM_TIMEOUT = 120  # seconds — hard ceiling per URL so a wedged worker can't hang the job
 
 LOG_DIR.mkdir(exist_ok=True)
 
@@ -101,6 +99,8 @@ if not jobs_logger.handlers:
 app = FastAPI()
 _executor = ThreadPoolExecutor(max_workers=CONCURRENCY)
 _semaphore = asyncio.Semaphore(CONCURRENCY)
+# Separate executor for merge work so a long merge doesn't block the conversion pool.
+_merge_executor = ThreadPoolExecutor(max_workers=1)
 
 
 class ConvertRequest(BaseModel):
@@ -169,6 +169,26 @@ async def post_convert(body: ConvertRequest):
     }
 
 
+async def _run_with_timeout(loop, job: dict, item: dict) -> list[str]:
+    """Run _convert_one_sync with a hard wall-clock timeout. On timeout the worker
+    thread leaks (Python can't kill threads); the executor slot stays held until
+    Playwright eventually unwinds. Item still flips to error so the UI moves on."""
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(_executor, _convert_one_sync, job, item),
+            timeout=ITEM_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        item["status"] = "error"
+        item["error"] = f"Took longer than {ITEM_TIMEOUT}s"
+        logger.error("[%s] Timed out: %s", job["id"], item["url"])
+        store.push_event(job["id"], {
+            "type": "status", "url_id": item["id"],
+            "status": "error", "error": item["error"],
+        })
+        return []
+
+
 async def _run_job(job: dict) -> None:
     loop = asyncio.get_running_loop()
 
@@ -185,7 +205,7 @@ async def _run_job(job: dict) -> None:
                         "status": "error", "error": "Cancelled",
                     })
                     return
-                await loop.run_in_executor(_executor, _convert_one_sync, job, item)
+                await _run_with_timeout(loop, job, item)
 
         results = await asyncio.gather(
             *[process_item(item) for item in job["items"]],
@@ -208,9 +228,7 @@ async def _run_job(job: dict) -> None:
             nonlocal active_count, cap_event_fired
             try:
                 async with _semaphore:
-                    new_urls = await loop.run_in_executor(
-                        _executor, _convert_one_sync, job, item
-                    )
+                    new_urls = await _run_with_timeout(loop, job, item)
                 for url in new_urls:
                     new_item = store.add_item(job["id"], url)
                     if new_item:
@@ -317,6 +335,7 @@ def _convert_one_sync(job: dict, item: dict) -> list[str]:
         item["file"] = str(out_path)
         item["size"] = out_path.stat().st_size
         item["filename"] = stem + suffix
+        job["merged_dirty"] = True
         logger.info("[%s] Done: %s → %s (%.1f KB)",
                     job["id"], url, item["filename"], item["size"] / 1024)
         store.push_event(job["id"], {
@@ -468,6 +487,58 @@ async def download_file(job_id: str, url_id: str):
     )
 
 
+def _download_filename(job: dict, ext: str) -> str:
+    """Browser-facing filename for downloads. Reuses sanitize_filename so dots,
+    quotes, slashes, and unicode all get the same treatment as URL stems."""
+    stem = (job.get("name") or "").strip() or "collection"
+    return f"{sanitize_filename(stem)}.{ext}"
+
+
+def _do_merge(fmt: str, done_items: list[dict], out_path: Path) -> None:
+    """Sync work — runs in _merge_executor so it doesn't block the event loop or
+    starve the conversion pool."""
+    if fmt == "pdf":
+        merge_pdfs([Path(i["file"]) for i in done_items], out_path)
+    else:
+        concat_markdown(done_items, out_path)
+
+
+@app.get("/api/jobs/{job_id}/merged")
+async def download_merged(job_id: str):
+    job = store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    done = [i for i in job["items"] if i["status"] == "done" and i["file"]]
+    if not done:
+        raise HTTPException(status_code=404, detail="No completed files")
+    fmt = job["format"]
+    ext = "pdf" if fmt == "pdf" else "md"
+    out_path = OUTPUT_ROOT / "_merged" / f"{job_id}.{ext}"
+    if job.get("merged_dirty", True) or not out_path.exists():
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(_merge_executor, _do_merge, fmt, done, out_path)
+        job["merged_dirty"] = False
+    return FileResponse(
+        path=str(out_path),
+        filename=_download_filename(job, ext),
+        media_type="application/pdf" if fmt == "pdf" else "text/markdown",
+    )
+
+
+class RenameRequest(BaseModel):
+    name: str
+
+
+@app.patch("/api/collections/{job_id}")
+async def rename_collection(job_id: str, body: RenameRequest):
+    job = store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    new_name = (body.name or "").strip()
+    job["name"] = new_name
+    return {"ok": True, "name": new_name}
+
+
 @app.get("/api/jobs/{job_id}/zip")
 async def download_zip(job_id: str):
     job = store.get(job_id)
@@ -481,8 +552,7 @@ async def download_zip(job_id: str):
         for item in done:
             zf.write(str(item["file"]), arcname=item["filename"])
     buf.seek(0)
-    raw_name = (job["name"].replace(" ", "_") or "collection") + ".zip"
-    zip_name = raw_name.replace('"', "").replace("\\", "")
+    zip_name = _download_filename(job, "zip")
     return StreamingResponse(
         buf,
         media_type="application/zip",
@@ -490,10 +560,5 @@ async def download_zip(job_id: str):
     )
 
 
-if WEB_DIR.exists():
-    app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="static")
-
-
 if __name__ == "__main__":
-    webbrowser.open("http://localhost:8000")
     uvicorn.run("server:app", host="127.0.0.1", port=8000)

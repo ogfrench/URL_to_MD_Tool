@@ -1,8 +1,14 @@
-from pathlib import Path
 import logging
+import re
+from pathlib import Path
 
 import html2text
 from playwright.sync_api import Page
+from pypdf import PdfWriter
+
+
+def _slugify(text: str) -> str:
+    return re.sub(r"[^\w]+", "-", (text or "").lower()).strip("-") or "section"
 
 logger = logging.getLogger("output")
 
@@ -39,3 +45,47 @@ def save_markdown(page: Page, path: Path, include_images: bool = False) -> None:
             path.name,
         )
     path.write_text(text, encoding="utf-8")
+
+
+def merge_pdfs(paths: list[Path], out: Path) -> None:
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    writer = PdfWriter()
+    for p in paths:
+        try:
+            writer.append(str(p))
+        except Exception as e:
+            logger.warning("merge_pdfs: skipping %s (%s)", p, e)
+    with out.open("wb") as f:
+        writer.write(f)
+    writer.close()
+
+
+def concat_markdown(items: list[dict], out: Path) -> None:
+    """Concatenate per-item markdown files into one with H1 dividers + TOC.
+    Anchors are deduped (-2, -3 ...) so collisions don't silently break links."""
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    seen: dict[str, int] = {}
+    anchors: list[str] = []
+    for it in items:
+        title = (it.get("title") or it.get("url") or "Untitled").strip()
+        base = _slugify(title)
+        seen[base] = seen.get(base, 0) + 1
+        anchors.append(base if seen[base] == 1 else f"{base}-{seen[base]}")
+
+    parts: list[str] = []
+    if items:
+        toc_lines = [f"- [{(it.get('title') or it.get('url') or 'Untitled').strip()}](#{a})"
+                     for it, a in zip(items, anchors)]
+        parts.append("# Contents\n\n" + "\n".join(toc_lines))
+    for it in items:
+        title = (it.get("title") or it.get("url") or "Untitled").strip()
+        url = it.get("url", "")
+        try:
+            body = Path(it["file"]).read_text(encoding="utf-8")
+        except Exception as e:
+            logger.warning("concat_markdown: couldn't read %s (%s)", it.get("file"), e)
+            continue
+        parts.append(f"# {title}\n\n_Source: <{url}>_\n\n{body}")
+    out.write_text("\n\n---\n\n".join(parts), encoding="utf-8")
