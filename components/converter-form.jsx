@@ -792,9 +792,6 @@ function Library({ collections, onDelete, onRename, onMissing, onGoNew }) {
   }, [collections, indexed, query]);
 
   const selected = selectedId ? collections.find((c) => c.id === selectedId) : null;
-  useEffect(() => {
-    if (selectedId && !selected) setSelectedId(null);
-  }, [selectedId, selected]);
 
   if (selected) {
     return (
@@ -880,10 +877,6 @@ function JobDetailView({ collection, onBack, onDelete, onRename, onMissing }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(collection.name || "");
 
-  useEffect(() => {
-    if (!editing) setDraft(collection.name || name || "");
-  }, [collection.name, name, editing]);
-
   async function commitRename() {
     const trimmed = draft.trim();
     if (!trimmed || trimmed === collection.name) {
@@ -966,10 +959,6 @@ function CollectionCard({ collection, onOpen, onDelete, onRename }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(collection.name || "");
   const suppressNextClickRef = useRef(false);
-
-  useEffect(() => {
-    if (!editing) setDraft(collection.name || "");
-  }, [collection.name, editing]);
 
   async function commit() {
     const trimmed = draft.trim();
