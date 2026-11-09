@@ -1,6 +1,6 @@
 # URL to PDF / Markdown
 
-Convert any web page — including paywalled articles — to a **PDF** or **Markdown** file for use in AI workflows (custom GPTs, RAG pipelines, NotebookLM, and similar tools).
+Convert web pages to **PDF** or **Markdown** for use in AI workflows such as research, retrieval and document review. Some protected sites require authorized access or may block automation; conversion is not a guarantee of access.
 
 ## Setup
 
@@ -92,7 +92,11 @@ python Code/combine_pdfs.py output/My_Collection False my_output.pdf  # custom n
 
 If a page fails to convert, a debug screenshot is saved in `logs/debug_screenshots/` with a timestamped, URL-based filename. Run with `--no-headless` to watch the browser in real time, or try `--freedium` for Medium.com articles.
 
-## Improving the converter with Claude Code
+## Troubleshooting with coding agents
+
+This project includes a **Claude Code-specific** `fix-conversion-failures` skill; other coding assistants can inspect the same converter, logs and tests but do not automatically load that skill. The repository does not define a universal agent installer.
+
+### Claude Code skill
 
 This repository ships a Claude Code skill — **`fix-conversion-failures`** — that helps diagnose and fix URLs that fail to convert. If you use Claude Code, the skill activates automatically whenever a conversion fails or you describe a scraping problem. It reads the logs and debug screenshots, classifies the failure (paywall, cookie banner, timeout, content check too strict, …), and proposes a targeted fix before touching any file.
 
